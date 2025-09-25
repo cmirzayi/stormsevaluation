@@ -1,0 +1,183 @@
+---
+title: "Updated Pairwise"
+format: html
+editor: visual
+---
+
+```{r}
+# Make sure dplyr is loaded
+library(dplyr)
+library(reshape2)
+library(tidyr)
+
+alldata <- readRDS("C:/rprojects/stormsevaluation/data/storms_eval.rds")
+
+
+#' Calculate Detailed Pairwise Rater Agreement
+#'
+#' This function calculates both the percent agreement and the number of common
+#' comparisons for each pair of raters across a list of data frames.
+#'
+#' @param df_list A list of data frames.
+#' @param id_col A character string for the name of the item identifier column.
+#'
+#' @return A list containing two matrices:
+#'         - `agreement`: Pairwise percent agreement.
+#'         - `counts`: Number of items rated in common by each pair.
+#'
+calculate_pairwise_agreement_detailed <- function(df_list, id_col) {
+  # Combine all data frames from the list into a single data.frame
+  combined_df <- dplyr::bind_rows(df_list) %>% select(where(~ !all(is.na(.))))
+  
+  # Determine how many raters we have
+  raters <- setdiff(names(combined_df), id_col)
+
+  if (length(raters) < 2) {
+    stop("Fewer than two rater columns found.")
+  }
+
+  # Create empty matrices for results
+  num_raters <- length(raters)
+  agreement_matrix <- comparison_counts <- matrix(
+    NA_real_,
+    nrow = num_raters,
+    ncol = num_raters,
+    dimnames = list(raters, raters)
+  )
+
+  # Get all unique pairs
+  rater_pairs <- combn(raters, 2, simplify = FALSE)
+
+  for (pair in rater_pairs) {
+    rater1 <- pair[1]
+    rater2 <- pair[2]
+
+    # Isolate data for the pair and remove rows with NAs
+    complete_cases <- na.omit(combined_df[, c(rater1, rater2)])
+    num_comparisons <- nrow(complete_cases)
+
+    if (num_comparisons > 0) {
+      agreement <- sum(complete_cases[[1]] == complete_cases[[2]]) / num_comparisons
+    } else {
+      agreement <- NA_real_
+    }
+
+    # Store results symmetrically
+    agreement_matrix[rater1, rater2] <- agreement_matrix[rater2, rater1] <- agreement
+    comparison_counts[rater1, rater2] <- comparison_counts[rater2, rater1] <- num_comparisons
+  }
+
+  # Diagonals
+  diag(agreement_matrix) <- 1.0
+  diag(comparison_counts) <- NA # A rater doesn't have a "pair count" with themselves
+
+  return(list(agreement = agreement_matrix, counts = comparison_counts))
+}
+```
+
+```{r}
+detailed_results <- calculate_pairwise_agreement_detailed(df_list = alldata, id_col = "Number")
+agreement_matrix <- detailed_results$agreement
+counts_matrix <- detailed_results$counts
+
+front_names <- c("AC", "GG", "OC")
+
+# Get all column names from one of the matrices
+all_names <- colnames(agreement_matrix)
+
+# Create the new order: front_names followed by all other names
+new_order <- c(front_names, setdiff(all_names, front_names))
+
+# Apply this new order to both the rows and columns of each matrix
+agreement_matrix <- agreement_matrix[new_order, new_order]
+counts_matrix <- counts_matrix[new_order, new_order]
+```
+
+```{r}
+# --- Calculate Weighted Average Agreement ---
+raters <- rownames(agreement_matrix)
+weighted_avg <- numeric(length(raters))
+names(weighted_avg) <- raters
+
+for (rater in raters) {
+  # Get the agreement scores and counts for this rater's pairs
+  agreements <- agreement_matrix[rater, ]
+  counts <- counts_matrix[rater, ]
+
+  # Calculate the weighted average, ignoring NA values
+  total_weighted_agreement <- sum(agreements * counts, na.rm = TRUE)
+  total_counts <- sum(counts, na.rm = TRUE)
+
+  if (total_counts > 0) {
+    weighted_avg[rater] <- total_weighted_agreement / total_counts
+  } else {
+    weighted_avg[rater] <- NA
+  }
+}
+```
+
+```{r}
+# --- Generate the Complex Heatmap ---
+
+# First, ensure packages are installed and loaded
+# install.packages("ComplexHeatmap")
+# install.packages("circlize")
+library(ComplexHeatmap)
+library(circlize)
+
+# 1. Prepare annotation data
+ai_raters <- c("GG", "AC", "OC")
+rater_type <- ifelse(raters %in% ai_raters, "AI Rater", "Human Rater")
+
+annotation_df <- data.frame(
+  Type = rater_type,
+  WeightedAvg = weighted_avg
+)
+
+
+
+# 2. Define colors
+type_colors <- c("AI Rater" = "#1f77b4", "Human Rater" = "#ff7f0e")
+avg_color_fun <- colorRamp2(c(min(weighted_avg, na.rm=T), max(weighted_avg, na.rm=T)), c("white", "purple"))
+heatmap_color_fun <- colorRamp2(c(0, 0.5, 1), c("tomato", "white", "steelblue"))
+
+# 3. Create the annotation object
+ha <- HeatmapAnnotation(
+  df = annotation_df,
+  col = list(Type = type_colors, WeightedAvg = avg_color_fun),
+  annotation_legend_param = list(
+     WeightedAvg = list(title = "Weighted Avg.")
+  )
+)
+
+# 4. Draw the heatmap
+ht <- Heatmap(
+  agreement_matrix,
+  name = "Agreement", # Legend title for the heatmap
+  col = heatmap_color_fun,
+
+  # Add the annotation bar to the top
+  top_annotation = ha,
+
+  # Split columns based on rater type to group them
+  column_split = annotation_df$Type,
+  column_title = "Rater Groups",
+
+  # Display the agreement values in the cells
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if(!is.na(agreement_matrix[i, j])) {
+      grid.text(sprintf("%.2f", agreement_matrix[i, j]), x, y, gp = gpar(fontsize = 10))
+    }
+  },
+
+  # Keep original ordering
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  # Aesthetics
+  rect_gp = gpar(col = "grey", lwd = 1)
+)
+
+# Draw the plot in the viewer
+draw(ht, heatmap_legend_side = "bottom", annotation_legend_side = "bottom", merge_legend = TRUE)
+```
