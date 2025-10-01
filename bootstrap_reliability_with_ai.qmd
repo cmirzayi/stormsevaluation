@@ -1,0 +1,176 @@
+---
+title: "Bootstrap"
+format: html
+editor: visual
+---
+
+## 
+
+```{r}
+# --- 1. Load Required Libraries ---
+# install.packages(c("dplyr", "tidyr", "irr"))
+library(dplyr)
+library(tidyr)
+library(irr)
+
+#' Run a Bootstrap Simulation for Rater Reliability
+#'
+#' @param df_list A list of data frames with rater data.
+#' @param id_col The name of the column containing the item identifier.
+#' @param ai_raters A character vector with the names of the AI raters.
+#' @param n_samples The number of articles to sample for each rater per iteration.
+#' @param n_iterations The total number of bootstrap iterations to run.
+#'
+#' @return A data frame with n_iterations rows, containing the bootstrapped
+#'         average Kappa scores for intra-AI and intra-human groups.
+run_bootstrap_simulation <- function(df_list,
+                                     id_col,
+                                     ai_raters,
+                                     n_samples = 3,
+                                     n_iterations = 1000) {
+
+  # --- Data Preparation (done once) ---
+  message("Preparing data...")
+  combined_df <- dplyr::bind_rows(df_list)
+  all_raters <- setdiff(names(combined_df), id_col)
+  human_raters <- setdiff(all_raters, ai_raters)
+
+  # Convert to a long format to easily find which rater rated which article
+  long_df <- combined_df %>%
+    pivot_longer(
+      cols = all_of(all_raters),
+      names_to = "rater",
+      values_to = "rating"
+    ) %>%
+    filter(!is.na(rating)) # Remove NAs
+
+  # Create a list of articles rated by each person
+  articles_per_rater <- long_df %>%
+    group_by(rater) %>%
+    summarise(articles = list(unique(.data[[id_col]])))
+
+  # --- Helper function to calculate summary Kappas for one dataset ---
+  calculate_summary_kappas <- function(data) {
+    # Get all pairwise combinations of raters present in the current sample
+    present_raters <- setdiff(names(data), id_col)
+    rater_pairs <- combn(present_raters, 2, simplify = FALSE)
+    
+    kappas <- list(intra_ai = c(), intra_human = c())
+
+    for (pair in rater_pairs) {
+      r1 <- pair[1]
+      r2 <- pair[2]
+
+      # Get data for the pair and remove items not rated by both
+      pair_data <- data %>%
+        select(all_of(c(r1, r2))) %>%
+        na.omit()
+
+      # Kappa requires at least 2 valid comparisons
+      if (nrow(pair_data) > 1) {
+        # Using "squared" weights for Weighted Kappa, suitable for ordinal scales
+        kappa_val <- irr::kappa2(pair_data, weight = "squared")$value
+
+        # Classify and store the kappa value
+        if (r1 %in% ai_raters && r2 %in% ai_raters) {
+          kappas$intra_ai <- c(kappas$intra_ai, kappa_val)
+        } else if (r1 %in% human_raters && r2 %in% human_raters) {
+          kappas$intra_human <- c(kappas$intra_human, kappa_val)
+        }
+      }
+    }
+    
+    # Return the mean kappa for each group, using NA if no pairs were found
+    return(
+      data.frame(
+        intra_ai_kappa = ifelse(length(kappas$intra_ai) > 0, mean(kappas$intra_ai), NA),
+        intra_human_kappa = ifelse(length(kappas$intra_human) > 0, mean(kappas$intra_human), NA)
+      )
+    )
+  }
+
+  # --- Main Bootstrap Loop ---
+  message(paste("Running", n_iterations, "bootstrap iterations..."))
+  
+  # Set up progress bar
+  pb <- txtProgressBar(min = 0, max = n_iterations, style = 3)
+  
+  results_list <- list() # To store results from each iteration
+
+  for (i in 1:n_iterations) {
+    # For each rater, sample n_samples articles *with replacement*
+    # This is the core of the bootstrap method
+    sampled_article_ids <- articles_per_rater %>%
+      # Ensure we don't try to sample more articles than a rater has
+      mutate(n_to_sample = pmin(n_samples, length(articles))) %>%
+      rowwise() %>%
+      summarise(sampled_ids = list(sample(articles, n_to_sample, replace = TRUE))) %>%
+      pull(sampled_ids) %>%
+      unlist() %>%
+      unique()
+
+    # Create the temporary dataset for this iteration
+    temp_df <- combined_df %>%
+      filter(.data[[id_col]] %in% sampled_article_ids)
+      
+    # Calculate and store metrics
+    results_list[[i]] <- calculate_summary_kappas(temp_df)
+    
+    setTxtProgressBar(pb, i) # Update progress bar
+  }
+  
+  close(pb) # Close progress bar
+  
+  # Combine all results into a single data frame
+  return(dplyr::bind_rows(results_list))
+}
+```
+
+```{r}
+
+ai_raters <- c("GG", "AC", "OC")
+bootstrap_results <- run_bootstrap_simulation(
+  df_list = alldata,
+  id_col = "Number",
+  ai_raters = ai_raters,
+  n_samples = 3,
+  n_iterations = 1000
+)
+
+summary(bootstrap_results)
+```
+
+```{r}
+ci_ai <- quantile(bootstrap_results$intra_ai_kappa, c(0.025, 0.975), na.rm = TRUE)
+ci_human <- quantile(bootstrap_results$intra_human_kappa, c(0.025, 0.975), na.rm = TRUE)
+
+cat("95% Confidence Interval for Intra-AI Kappa:", round(ci_ai, 3), "\n")
+cat("95% Confidence Interval for Intra-Human Kappa:", round(ci_human, 3), "\n")
+
+```
+
+```{r}
+# --- 5. (Optional) Visualize the Distributions ---
+# install.packages("ggplot2")
+library(ggplot2)
+
+# Reshape data for plotting
+plot_data <- bootstrap_results %>%
+  pivot_longer(cols = everything(), names_to = "group", values_to = "kappa")
+
+# Create density plots
+ggplot(plot_data, aes(x = kappa, fill = group)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(
+    values = c("intra_ai_kappa" = "skyblue", "intra_human_kappa" = "salmon"),
+    labels = c("Intra-AI", "Intra-Human")
+  ) +
+  labs(
+    title = "Bootstrap Distributions of Rater Reliability",
+    subtitle = "Comparing Intra-AI and Intra-Human Weighted Kappa Scores",
+    x = "Average Weighted Kappa",
+    y = "Density",
+    fill = "Rater Group"
+  ) +
+  theme_minimal()
+```
