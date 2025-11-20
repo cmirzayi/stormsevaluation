@@ -7,121 +7,129 @@ editor: visual
 ## 
 
 ```{r}
-# --- 1. Load Required Libraries ---
-# install.packages(c("dplyr", "tidyr", "irr"))
 library(dplyr)
 library(tidyr)
 library(irr)
 
-#' Run a Bootstrap Simulation for Rater Reliability
-#'
-#' @param df_list A list of data frames with rater data.
-#' @param id_col The name of the column containing the item identifier.
-#' @param ai_raters A character vector with the names of the AI raters.
-#' @param n_samples The number of articles to sample for each rater per iteration.
-#' @param n_iterations The total number of bootstrap iterations to run.
-#'
-#' @return A data frame with n_iterations rows, containing the bootstrapped
-#'         average Kappa scores for intra-AI and intra-human groups.
-run_bootstrap_simulation <- function(df_list,
-                                     id_col,
-                                     ai_raters,
-                                     n_samples = 3,
-                                     n_iterations = 1000) {
+#' Run a Bootstrap Simulation for Rater Reliability (Corrected for List Structure)
+#' 
+#' @param df_list List of dataframes, where each dataframe is ONE article.
+#' @param ai_raters Vector of names of the AI raters.
+#' @param n_iterations Number of bootstrap iterations.
+run_bootstrap_simulation_final <- function(df_list,
+                                           ai_raters,
+                                           n_iterations = 1000) {
 
-  # --- Data Preparation (done once) ---
-  message("Preparing data...")
-  combined_df <- dplyr::bind_rows(df_list)
-  all_raters <- setdiff(names(combined_df), id_col)
-  human_raters <- setdiff(all_raters, ai_raters)
-
-  # Convert to a long format to easily find which rater rated which article
-  long_df <- combined_df %>%
-    pivot_longer(
-      cols = all_of(all_raters),
-      names_to = "rater",
-      values_to = "rating"
-    ) %>%
-    filter(!is.na(rating)) # Remove NAs
-
-  # Create a list of articles rated by each person
-  articles_per_rater <- long_df %>%
-    group_by(rater) %>%
-    summarise(articles = list(unique(.data[[id_col]])))
-
-  # --- Helper function to calculate summary Kappas for one dataset ---
-  calculate_summary_kappas <- function(data) {
-    # Get all pairwise combinations of raters present in the current sample
-    present_raters <- setdiff(names(data), id_col)
-    rater_pairs <- combn(present_raters, 2, simplify = FALSE)
+  # --- 1. Data Preparation: Assign Article IDs ---
+  message("Assigning Article IDs based on list index...")
+  
+  # We iterate through the list index (1, 2, 3...) and add that number as a column.
+  # This ensures that "Item 1.0" from Article 1 is distinct from "Item 1.0" from Article 2.
+  df_list_labeled <- lapply(seq_along(df_list), function(i) {
+    d <- df_list[[i]]
     
-    kappas <- list(intra_ai = c(), intra_human = c())
+    # Force all columns to character to avoid type mismatches (e.g. logical vs char)
+    d <- d %>% mutate(across(everything(), as.character))
+    
+    # Create the Article ID
+    d$Article_ID <- paste0("Article_", i)
+    return(d)
+  })
+  
+  combined_df <- dplyr::bind_rows(df_list_labeled)
+  
+  # Identify the unique units of analysis (The Articles)
+  all_article_ids <- unique(combined_df$Article_ID)
+  n_articles <- length(all_article_ids)
+  
+  message(paste("Processing", n_articles, "unique articles."))
+
+  # --- 2. Helper Function: Kappa Calculation ---
+  calculate_summary_kappas <- function(data) {
+    # Identify raters by excluding metadata columns
+    meta_cols <- c("Number", "Article_ID", "sample_id")
+    present_raters <- setdiff(names(data), meta_cols)
+    
+    # Prepare containers
+    kappas <- list(intra_ai = c(), intra_human = c(), ai_human = c())
+
+    # Generate all possible pairs from the columns present in this sample
+    rater_pairs <- combn(present_raters, 2, simplify = FALSE)
 
     for (pair in rater_pairs) {
       r1 <- pair[1]
       r2 <- pair[2]
-
-      # Get data for the pair and remove items not rated by both
+      
+      # Extract data for this pair
       pair_data <- data %>%
         select(all_of(c(r1, r2))) %>%
-        na.omit()
+        # IMPORTANT: Convert "NOT PRESENT" to NA if you want to exclude it, 
+        # or keep it if it's a valid category. 
+        # irr::kappa2 automatically drops rows with NAs.
+        filter(!is.na(.[[1]]) & !is.na(.[[2]]))
 
-      # Kappa requires at least 2 valid comparisons
-      if (nrow(pair_data) > 1) {
-        # Using "squared" weights for Weighted Kappa, suitable for ordinal scales
-        kappa_val <- irr::kappa2(pair_data, weight = "squared")$value
+      # Only calculate if we have enough overlap (e.g., >5 items)
+      if (nrow(pair_data) >= 5) {
+        
+        # Use "unweighted" for nominal data (Yes/No/Not Present)
+        k_val <- tryCatch({
+          irr::kappa2(pair_data, weight = "unweighted")$value
+        }, error = function(e) NA)
 
-        # Classify and store the kappa value
-        if (r1 %in% ai_raters && r2 %in% ai_raters) {
-          kappas$intra_ai <- c(kappas$intra_ai, kappa_val)
-        } else if (r1 %in% human_raters && r2 %in% human_raters) {
-          kappas$intra_human <- c(kappas$intra_human, kappa_val)
+        if (!is.na(k_val)) {
+          is_r1_ai <- r1 %in% ai_raters
+          is_r2_ai <- r2 %in% ai_raters
+          
+          if (is_r1_ai && is_r2_ai) {
+            kappas$intra_ai <- c(kappas$intra_ai, k_val)
+          } else if (!is_r1_ai && !is_r2_ai) {
+            kappas$intra_human <- c(kappas$intra_human, k_val)
+          } else {
+            kappas$ai_human <- c(kappas$ai_human, k_val)
+          }
         }
       }
     }
     
-    # Return the mean kappa for each group, using NA if no pairs were found
-    return(
-      data.frame(
-        intra_ai_kappa = ifelse(length(kappas$intra_ai) > 0, mean(kappas$intra_ai), NA),
-        intra_human_kappa = ifelse(length(kappas$intra_human) > 0, mean(kappas$intra_human), NA)
-      )
-    )
+    # Return averages
+    return(data.frame(
+      intra_ai_kappa    = ifelse(length(kappas$intra_ai) > 0, mean(kappas$intra_ai, na.rm=TRUE), NA),
+      intra_human_kappa = ifelse(length(kappas$intra_human) > 0, mean(kappas$intra_human, na.rm=TRUE), NA),
+      ai_human_kappa    = ifelse(length(kappas$ai_human) > 0, mean(kappas$ai_human, na.rm=TRUE), NA)
+    ))
   }
 
-  # --- Main Bootstrap Loop ---
+  # --- 3. Bootstrap Loop ---
   message(paste("Running", n_iterations, "bootstrap iterations..."))
-  
-  # Set up progress bar
   pb <- txtProgressBar(min = 0, max = n_iterations, style = 3)
-  
-  results_list <- list() # To store results from each iteration
+  results_list <- list()
 
   for (i in 1:n_iterations) {
-    # For each rater, sample n_samples articles *with replacement*
-    # This is the core of the bootstrap method
-    sampled_article_ids <- articles_per_rater %>%
-      # Ensure we don't try to sample more articles than a rater has
-      mutate(n_to_sample = pmin(n_samples, length(articles))) %>%
-      rowwise() %>%
-      summarise(sampled_ids = list(sample(articles, n_to_sample, replace = TRUE))) %>%
-      pull(sampled_ids) %>%
-      unlist() %>%
-      unique()
-
-    # Create the temporary dataset for this iteration
-    temp_df <- combined_df %>%
-      filter(.data[[id_col]] %in% sampled_article_ids)
+    
+    # A. Sample Article IDs (Cluster Bootstrap)
+    # We sample N articles with replacement.
+    sampled_ids <- sample(all_article_ids, n_articles, replace = TRUE)
+    
+    # B. Create Sampling Frame
+    # This table records which articles we picked, allowing duplicates.
+    sampling_frame <- data.frame(
+      Article_ID = sampled_ids,
+      sample_id = 1:n_articles # Unique ID for this specific bootstrap instance
+    )
+    
+    # C. Join to get the full data
+    # This grabs ALL items (1.0, 1.1...) for every sampled article.
+    # If Article_1 is sampled twice, it appears twice here.
+    temp_df <- sampling_frame %>%
+      left_join(combined_df, by = "Article_ID", relationship = "many-to-many")
       
-    # Calculate and store metrics
+    # D. Calculate Metrics for this sample
     results_list[[i]] <- calculate_summary_kappas(temp_df)
     
-    setTxtProgressBar(pb, i) # Update progress bar
+    setTxtProgressBar(pb, i)
   }
   
-  close(pb) # Close progress bar
-  
-  # Combine all results into a single data frame
+  close(pb)
   return(dplyr::bind_rows(results_list))
 }
 ```
@@ -129,23 +137,25 @@ run_bootstrap_simulation <- function(df_list,
 ```{r}
 
 ai_raters <- c("GG", "AC", "OC")
-bootstrap_results <- run_bootstrap_simulation(
+bootstrap_results <- run_bootstrap_simulation_final(
   df_list = alldata,
-  id_col = "Number",
   ai_raters = ai_raters,
-  n_samples = 3,
   n_iterations = 1000
 )
 
 summary(bootstrap_results)
+
+bootstrap_results_v2 <- bootstrap_results
 ```
 
 ```{r}
-ci_ai <- quantile(bootstrap_results$intra_ai_kappa, c(0.025, 0.975), na.rm = TRUE)
-ci_human <- quantile(bootstrap_results$intra_human_kappa, c(0.025, 0.975), na.rm = TRUE)
+ci_ai <- quantile(bootstrap_results_v2$intra_ai_kappa, c(0.025, 0.975), na.rm = TRUE)
+ci_human <- quantile(bootstrap_results_v2$intra_human_kappa, c(0.025, 0.975), na.rm = TRUE)
+ci_ai_human <- quantile(bootstrap_results_v2$ai_human_kappa, c(0.025, 0.975), na.rm = TRUE)
 
-cat("95% Confidence Interval for Intra-AI Kappa:", round(ci_ai, 3), "\n")
-cat("95% Confidence Interval for Intra-Human Kappa:", round(ci_human, 3), "\n")
+cat("95% CI for Intra-AI Kappa:    ", round(ci_ai, 3), "\n")
+cat("95% CI for Intra-Human Kappa:  ", round(ci_human, 3), "\n")
+cat("95% CI for AI-Human Kappa:     ", round(ci_ai_human, 3), "\n")
 
 ```
 
@@ -155,19 +165,18 @@ cat("95% Confidence Interval for Intra-Human Kappa:", round(ci_human, 3), "\n")
 library(ggplot2)
 
 # Reshape data for plotting
-plot_data <- bootstrap_results %>%
+plot_data_v2 <- bootstrap_results_v2 %>%
   pivot_longer(cols = everything(), names_to = "group", values_to = "kappa")
 
-# Create density plots
-ggplot(plot_data, aes(x = kappa, fill = group)) +
+ggplot(plot_data_v2, aes(x = kappa, fill = group)) +
   geom_density(alpha = 0.7) +
   scale_fill_manual(
-    values = c("intra_ai_kappa" = "skyblue", "intra_human_kappa" = "salmon"),
-    labels = c("Intra-AI", "Intra-Human")
+    values = c("intra_ai_kappa" = "skyblue", "intra_human_kappa" = "salmon", "ai_human_kappa" = "lightgreen"),
+    labels = c("AI-Human", "Intra-AI", "Intra-Human")
   ) +
   labs(
     title = "Bootstrap Distributions of Rater Reliability",
-    subtitle = "Comparing Intra-AI and Intra-Human Weighted Kappa Scores",
+    subtitle = "Comparing Intra-AI, Intra-Human, and AI-Human Agreement",
     x = "Average Weighted Kappa",
     y = "Density",
     fill = "Rater Group"
