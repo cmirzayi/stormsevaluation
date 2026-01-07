@@ -134,8 +134,6 @@ annotation_df <- data.frame(
   WeightedAvg = weighted_avg
 )
 
-
-
 # 2. Define colors
 type_colors <- c("AI Rater" = "#1f77b4", "Human Rater" = "#ff7f0e")
 avg_color_fun <- colorRamp2(c(min(weighted_avg, na.rm=T), max(weighted_avg, na.rm=T)), c("white", "purple"))

@@ -1,0 +1,130 @@
+---
+title: "item_agreement_with_ai"
+author: "Chloe Mirzayi"
+format: html
+editor: visual
+---
+
+# Read in data
+
+```{r}
+
+library(reshape2)
+library(tidyr)
+
+alldata <- readRDS("C:/rprojects/stormsevaluation/data/storms_eval.rds")
+```
+
+# Calculate item-level agreement
+
+```{r}
+library(matrixStats)
+iagree <- function(item) {
+  rowagree <- vector(mode="list", length=length(itemdata))
+  
+  for (i in 1:length(itemdata)) {
+    # 1. Clean data and select the specific item (row)
+    ds <- itemdata[[i]] %>% 
+      mutate(across(everything(), ~toupper(replace_na(as.character(.), "MISSING"))))
+    
+    row_data <- ds[item, ]
+    
+    # 2. Identify Rater Columns (Excluding the first column which is usually the Item ID)
+    raters <- row_data[, -1] 
+    
+    # 3. Dynamic Denominator: n * (n - 1)
+    # n is the count of valid (non-MISSING) rater entries
+    n <- sum(raters != "MISSING")
+    denom <- n * (n - 1)
+    
+    # 4. Calculate Numerators dynamically for each possible category
+    # Formula: sum( x * (x - 1) ) where x is the count of each category
+    categories <- c("YES", "NOT PRESENT", "NO")
+    
+    numerators <- sapply(categories, function(cat) {
+      x <- sum(raters == cat)
+      return(x * (x - 1))
+    })
+    
+    # 5. Calculate agreement for this row
+    # Use an if-check to handle rows with 0 or 1 rater to avoid division by zero
+    if (denom > 0) {
+      rowagree[[i]] <- sum(numerators) / denom
+    } else {
+      rowagree[[i]] <- NA
+    }
+  }
+  
+  # Final formatting
+  agree_df <- do.call(rbind, rowagree) %>% as.data.frame()
+  meanagree <- mean(agree_df[[1]], na.rm = TRUE)
+  sdagree <- sd(agree_df[[1]], na.rm = TRUE)
+  
+  data.frame(item = ds[item, 1], agreement = meanagree, sd = sdagree)
+}
+```
+
+```{r}
+# Select only articles with 3 human reviewers
+itemdata <- alldata[-c(16,17,29)]
+
+#Calculate item agreement scores
+listagree <- lapply(1:69, iagree)
+
+#Transform to data frame
+all <- listagree %>% melt() %>% pivot_wider(id_cols=Number, names_from=variable, values_from=value)
+
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+
+# 1. Define the core calculation logic for a single row
+calc_row_stats <- function(row_subset) {
+  vals <- as.character(row_subset)
+  vals <- vals[vals != "MISSING" & !is.na(vals) & vals != ""]
+  n <- length(vals)
+  if (n < 2) return(NA)
+  
+  denom <- n * (n - 1)
+  nums <- sapply(c("YES", "NOT PRESENT", "NO"), function(cat) {
+    x <- sum(vals == cat)
+    x * (x - 1)
+  })
+  return(sum(nums) / denom)
+}
+
+# 2. Process all dataframes in the itemdata list
+all_results <- map_dfr(itemdata, function(ds) {
+  
+  # Ensure data is clean (standardize to Uppercase)
+  ds <- ds %>% mutate(across(everything(), ~toupper(as.character(.))))
+  
+  # Calculate for each row in this specific dataframe
+  # Assuming: Col 1 = ID, Cols 2-4 = Humans, Cols 5-7 = AI (OC, AC, GG)
+  rowwise_stats <- map_dfr(1:nrow(ds), function(i) {
+    data.frame(
+      item_id   = ds[i, 1],
+      h_h_agree = calc_row_stats(ds[i, 2:4]),
+      a_a_agree = calc_row_stats(ds[i, 5:7]),
+      total_agree = calc_row_stats(ds[i, 2:7])
+    )
+  })
+  
+  return(rowwise_stats)
+})
+
+# 3. Calculate Global Averages
+summary_stats <- all_results %>%
+  summarise(
+    mean_human_human = mean(h_h_agree, na.rm = TRUE),
+    mean_ai_ai       = mean(a_a_agree, na.rm = TRUE),
+    mean_total       = mean(total_agree, na.rm = TRUE),
+    sd_total         = sd(total_agree, na.rm = TRUE),
+    n_items          = n()
+  )
+
+print(summary_stats)
+```
